@@ -1,0 +1,178 @@
+import os
+import librosa
+import numpy as np
+
+class ComprehensiveVoiceTripwire:
+    def __init__(self, target_sr=16000):
+        self.sr = target_sr
+
+    def analyze(self, file_path: str) -> dict:
+        if not os.path.exists(file_path):
+            raise FileNotFoundError(f"Audio file not found at path: {file_path}")
+
+        # 1. Load audio wave x[n]
+        y, sr = librosa.load(file_path, sr=self.sr)
+
+        # Trim leading and trailing silences
+        y, _ = librosa.effects.trim(y, top_db=25)
+
+        # Peak normalize waveform to eliminate volume/mic-distance bias
+        if np.max(np.abs(y)) > 0:
+            y = librosa.util.normalize(y)
+
+        duration = float(librosa.get_duration(y=y, sr=sr))
+        if duration < 0.3:
+            raise ValueError("Audio clip is too short for mathematical signal verification (minimum 0.3s required).")
+
+        # ------------------------------------------------------------------
+        # 2. TIME-FREQUENCY SPECTROGRAM COMPUTATION (STFT)
+        # ------------------------------------------------------------------
+        n_fft = 2048
+        hop_length = 512
+        stft_complex = librosa.stft(y, n_fft=n_fft, hop_length=hop_length)
+        stft_mag = np.abs(stft_complex)
+        stft_phase = np.angle(stft_complex)
+        power_spec = stft_mag ** 2
+
+        # ------------------------------------------------------------------
+        # 3. FUNDAMENTAL FREQUENCY (F0), JITTER & SHIMMER ANALYSIS
+        # ------------------------------------------------------------------
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            y, fmin=librosa.note_to_hz('C2'), fmax=librosa.note_to_hz('C7'), sr=sr
+        )
+        valid_f0 = f0[~np.isnan(f0)] if f0 is not None else np.array([])
+
+        if len(valid_f0) > 3:
+            f0_mean = float(np.mean(valid_f0))
+            f0_std = float(np.std(valid_f0))
+            periods = 1.0 / valid_f0
+            jitter_local = float(np.mean(np.abs(np.diff(periods))) / np.mean(periods))
+
+            frame_energies = librosa.feature.rms(y=y, frame_length=n_fft, hop_length=hop_length)[0]
+            valid_energies = frame_energies[:len(valid_f0)]
+            shimmer_local = float(np.mean(np.abs(np.diff(valid_energies))) / (np.mean(valid_energies) + 1e-8))
+        else:
+            f0_mean, f0_std, jitter_local, shimmer_local = 0.0, 0.0, 0.0, 0.0
+
+        # ------------------------------------------------------------------
+        # 4. HARMONIC-TO-NOISE RATIO (HNR)
+        # ------------------------------------------------------------------
+        y_harmonic, y_percussive = librosa.effects.hpss(y)
+        harmonic_energy = np.sum(y_harmonic ** 2)
+        noise_energy = np.sum(y_percussive ** 2) + 1e-8
+        hnr_db = float(10.0 * np.log10(harmonic_energy / noise_energy))
+
+        # ------------------------------------------------------------------
+        # 5. SPECTRAL FLATNESS & CENTROID
+        # ------------------------------------------------------------------
+        flatness = librosa.feature.spectral_flatness(S=stft_mag)[0]
+        flatness_mean = float(np.mean(flatness))
+
+        # ------------------------------------------------------------------
+        # 6. HIGH-FREQUENCY ENERGY RATIO (HFER)
+        # ------------------------------------------------------------------
+        fft_freqs = librosa.fft_frequencies(sr=sr, n_fft=n_fft)
+        high_freq_mask = fft_freqs >= 7000.0
+        total_energy = np.sum(power_spec) + 1e-8
+        high_freq_energy = np.sum(power_spec[high_freq_mask, :])
+        hfer_ratio = float(high_freq_energy / total_energy)
+
+        # ------------------------------------------------------------------
+        # 7. MFCCs, VELOCITY (Δ), AND ACCELERATION (Δ²)
+        # ------------------------------------------------------------------
+        mfccs = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=20)
+        mfcc_delta = librosa.feature.delta(mfccs, order=1)
+        mfcc_delta2 = librosa.feature.delta(mfccs, order=2)
+
+        delta_var_mean = float(np.mean(np.var(mfcc_delta, axis=1)))
+        delta2_var_mean = float(np.mean(np.var(mfcc_delta2, axis=1)))
+
+        # ------------------------------------------------------------------
+        # 8. SPECTRAL ROLLOFF (85%)
+        # ------------------------------------------------------------------
+        rolloff_85 = librosa.feature.spectral_rolloff(S=stft_mag, sr=sr, roll_percent=0.85)[0]
+        rolloff_85_mean = float(np.mean(rolloff_85))
+
+        # ------------------------------------------------------------------
+        # 9. SPECTRAL FLUX
+        # ------------------------------------------------------------------
+        spectral_flux = np.sqrt(np.sum(np.diff(stft_mag, axis=1) ** 2, axis=0))
+        flux_var = float(np.var(spectral_flux))
+
+        # ------------------------------------------------------------------
+        # 10. PHASE INSTABILITY ANALYSIS
+        # ------------------------------------------------------------------
+        phase_diff = np.diff(stft_phase, axis=1)
+        phase_unwrapped = np.unwrap(phase_diff, axis=0)
+        phase_instability_var = float(np.mean(np.var(phase_unwrapped, axis=1)))
+
+        # ------------------------------------------------------------------
+        # FINE-TUNED DISCRIMINATOR ENGINE
+        # ------------------------------------------------------------------
+        anomaly_vector = {}
+
+        # Metric 1: Jitter
+        if jitter_local < 0.003 or jitter_local > 0.09:
+            anomaly_vector["jitter"] = 0.20
+
+        # Metric 2: Shimmer
+        if shimmer_local < 0.008:
+            anomaly_vector["shimmer"] = 0.15
+
+        # Metric 3: MFCC Phoneme Transition Smoothness
+        if delta_var_mean < 12.0:
+            anomaly_vector["mfcc_delta_smoothness"] = 0.25
+
+        # Metric 4: Phase Discontinuity (Vocoder phase artifact)
+        if phase_instability_var > 12.0 or phase_instability_var < 0.8:
+            anomaly_vector["phase_anomaly"] = 0.20
+
+        # Metric 5: Spectral Flatness
+        if flatness_mean > 0.015 or flatness_mean < 0.00002:
+            anomaly_vector["spectral_flatness"] = 0.15
+
+        # Total Weighted Anomaly Score
+        total_anomaly_score = sum(anomaly_vector.values())
+
+        # Print detailed diagnostics to terminal
+        print("\n" + "="*60)
+        print(f" DIAGNOSTIC RUN FOR: {os.path.basename(file_path)}")
+        print("="*60)
+        print(f" • Jitter (Local)           : {jitter_local:.6f}")
+        print(f" • Shimmer (Local)          : {shimmer_local:.6f}")
+        print(f" • MFCC Delta Variance      : {delta_var_mean:.2f}")
+        print(f" • Phase Instability Var    : {phase_instability_var:.4f}")
+        print(f" • Spectral Flatness        : {flatness_mean:.7f}")
+        print(f" • Triggered Anomalies      : {list(anomaly_vector.keys())}")
+        print(f" • Total Anomaly Score      : {total_anomaly_score:.2f}")
+        print("="*60 + "\n")
+
+        # Threshold Verdict: Score >= 0.35 indicates AI synthetic speech
+        is_deepfake = total_anomaly_score >= 0.35
+
+        # Dynamic Confidence Calculation
+        if is_deepfake:
+            confidence = round(min(99.9, max(65.0, 50.0 + (total_anomaly_score * 60.0))), 1)
+        else:
+            confidence = round(min(99.9, max(65.0, 100.0 - (total_anomaly_score * 100.0))), 1)
+
+        return {
+            "duration_seconds": round(duration, 2),
+            "verdict": "RED_SPOOF" if is_deepfake else "GREEN_HUMAN",
+            "confidence_percent": confidence,
+            "total_anomaly_score": round(total_anomaly_score, 3),
+            "detected_anomalies": list(anomaly_vector.keys()),
+            "mathematical_metrics": {
+                "1_local_jitter": f"{jitter_local:.6f}",
+                "2_local_shimmer": f"{shimmer_local:.6f}",
+                "3_hnr_db": f"{hnr_db:.2f} dB",
+                "4_spectral_flatness": f"{flatness_mean:.7f}",
+                "5_high_freq_energy_ratio": f"{hfer_ratio:.6f}",
+                "6_mfcc_delta_variance": f"{delta_var_mean:.2f}",
+                "7_mfcc_delta2_variance": f"{delta2_var_mean:.2f}",
+                "8_spectral_rolloff_85_hz": f"{rolloff_85_mean:.1f} Hz",
+                "9_spectral_flux_variance": f"{flux_var:.4f}",
+                "10_phase_instability_variance": f"{phase_instability_var:.4f}",
+                "fundamental_frequency_f0_mean_hz": f"{f0_mean:.1f} Hz"
+            }
+        }
