@@ -9,43 +9,52 @@
 <body class="bg-gray-100 min-h-screen flex items-center justify-center p-4">
     <div class="bg-white rounded-xl shadow-lg p-8 max-w-md w-full">
         <h1 class="text-2xl font-bold text-gray-800 mb-2">Deepfake Voice Tripwire</h1>
-        <p class="text-gray-500 mb-6 text-sm">Upload a short audio clip (WAV or MP3) to check if the voice is human or AI-generated.</p>
+        <p class="text-gray-500 mb-6 text-sm">Upload an audio clip or record your voice live to check if it's human or AI-generated.</p>
 
+        <!-- Live Recording Section -->
+        <div class="mb-6 p-4 border-2 border-gray-200 rounded-lg bg-gray-50 text-center">
+            <h3 class="font-semibold text-gray-700 mb-3">Live Microphone Check</h3>
+            <button id="recordBtn" class="bg-red-500 text-white font-bold py-2 px-6 rounded-full hover:bg-red-600 transition-colors flex items-center justify-center mx-auto w-40">
+                <span id="recordIcon" class="mr-2">⏺</span>
+                <span id="recordText">Record</span>
+            </button>
+            <p id="recordStatus" class="text-xs text-gray-500 mt-2 hidden">Recording... Click to stop.</p>
+        </div>
+
+        <div class="flex items-center justify-center mb-6">
+            <span class="text-gray-400 text-sm font-semibold uppercase">Or Upload File</span>
+        </div>
+
+        <!-- File Upload Form -->
         <form id="uploadForm" class="space-y-4">
             <div class="border-2 border-dashed border-gray-300 rounded-lg p-6 text-center hover:border-blue-500 transition-colors">
-                <input type="file" id="audioFile" accept="audio/*" required class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
+                <input type="file" id="audioFile" accept="audio/*" class="w-full text-sm text-gray-500 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-50 file:text-blue-700 hover:file:bg-blue-100"/>
             </div>
             <button type="submit" class="w-full bg-blue-600 text-white font-bold py-3 px-4 rounded-lg hover:bg-blue-700 transition-colors">
-                Analyze Audio
+                Analyze Upload
             </button>
         </form>
 
+        <!-- Loading State -->
         <div id="loading" class="hidden mt-6 text-center text-blue-600 font-semibold animate-pulse">
-            Running audio through AI detection model...
+            Analyzing mathematical acoustics...
         </div>
 
+        <!-- Results Display -->
         <div id="resultBox" class="hidden mt-6 p-4 rounded-lg border text-center">
             <h2 id="resultMessage" class="text-xl font-bold"></h2>
-            <p id="resultRaw" class="text-xs text-gray-400 mt-3 font-mono"></p>
+            <p id="resultRaw" class="text-xs text-gray-400 mt-3 font-mono text-left break-all bg-gray-50 p-2 rounded max-h-40 overflow-y-auto"></p>
         </div>
     </div>
 
     <script>
-        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
-            e.preventDefault();
+        const resultBox = document.getElementById('resultBox');
+        const loading = document.getElementById('loading');
+        const resultMessage = document.getElementById('resultMessage');
+        const resultRaw = document.getElementById('resultRaw');
 
-            const fileInput = document.getElementById('audioFile');
-            const resultBox = document.getElementById('resultBox');
-            const loading = document.getElementById('loading');
-            const resultMessage = document.getElementById('resultMessage');
-            const resultRaw = document.getElementById('resultRaw');
-
-            if (fileInput.files.length === 0) return;
-
-            const formData = new FormData();
-            formData.append('file', fileInput.files[0]);
-
-            // Reset UI
+        // --- CORE API CALL FUNCTION ---
+        async function sendAudioToBackend(formData) {
             resultBox.classList.add('hidden');
             loading.classList.remove('hidden');
 
@@ -57,23 +66,110 @@
 
                 const data = await response.json();
 
-                // Update UI based on result
                 loading.classList.add('hidden');
                 resultBox.classList.remove('hidden');
 
+                if (data.error) {
+                    resultMessage.innerText = "Error Analyzing Audio";
+                    resultRaw.innerText = data.error;
+                    resultBox.className = "mt-6 p-4 rounded-lg border text-center border-orange-500 bg-orange-50 text-orange-700";
+                    return;
+                }
+
                 resultMessage.innerText = data.message;
-                resultRaw.innerText = `Raw Model Output: ${JSON.stringify(data.raw_result)}`;
+
+                // Format the JSON nicely for the UI
+                let rawText = "Metrics:\n";
+                for (const [key, value] of Object.entries(data.raw_result)) {
+                    rawText += `${key}: ${value}\n`;
+                }
+                resultRaw.innerText = rawText;
 
                 if (data.is_deepfake) {
                     resultBox.className = "mt-6 p-4 rounded-lg border text-center border-red-500 bg-red-50 text-red-700";
                 } else {
                     resultBox.className = "mt-6 p-4 rounded-lg border text-center border-green-500 bg-green-50 text-green-700";
                 }
-
             } catch (error) {
                 loading.classList.add('hidden');
-                alert('Error analyzing audio. Please try again.');
+                alert('Connection error. Is the server running?');
                 console.error(error);
+            }
+        }
+
+        // --- FILE UPLOAD HANDLER ---
+        document.getElementById('uploadForm').addEventListener('submit', (e) => {
+            e.preventDefault();
+            const fileInput = document.getElementById('audioFile');
+            if (fileInput.files.length === 0) {
+                alert("Please select a file first.");
+                return;
+            }
+            const formData = new FormData();
+            formData.append('file', fileInput.files[0]);
+            sendAudioToBackend(formData);
+        });
+
+        // --- LIVE RECORDING HANDLER ---
+        let mediaRecorder;
+        let audioChunks = [];
+        let isRecording = false;
+
+        const recordBtn = document.getElementById('recordBtn');
+        const recordText = document.getElementById('recordText');
+        const recordIcon = document.getElementById('recordIcon');
+        const recordStatus = document.getElementById('recordStatus');
+
+        recordBtn.addEventListener('click', async () => {
+            if (!isRecording) {
+                // START RECORDING
+                try {
+                    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+                    mediaRecorder = new MediaRecorder(stream);
+                    audioChunks = [];
+
+                    mediaRecorder.ondataavailable = event => {
+                        audioChunks.push(event.data);
+                    };
+
+                    mediaRecorder.onstop = () => {
+                        // When stopped, package into a blob and send to backend
+                        const audioBlob = new Blob(audioChunks, { type: 'audio/webm' });
+                        const formData = new FormData();
+                        // Give it a generic filename so Flask accepts it
+                        formData.append('file', audioBlob, 'live_recording.webm');
+
+                        // Stop all microphone tracks to release the hardware
+                        stream.getTracks().forEach(track => track.stop());
+
+                        sendAudioToBackend(formData);
+                    };
+
+                    mediaRecorder.start();
+                    isRecording = true;
+
+                    // Update UI to show recording state
+                    recordBtn.classList.remove('bg-red-500', 'hover:bg-red-600');
+                    recordBtn.classList.add('bg-gray-800', 'hover:bg-black', 'animate-pulse');
+                    recordText.innerText = "Stop";
+                    recordIcon.innerText = "⏹";
+                    recordStatus.classList.remove('hidden');
+
+                } catch (err) {
+                    alert("Microphone access denied or unavailable.");
+                    console.error("Microphone Error: ", err);
+                }
+            } else {
+                // STOP RECORDING
+                mediaRecorder.stop();
+                isRecording = false;
+
+                // Reset UI
+                recordBtn.classList.remove('bg-gray-800', 'hover:bg-black', 'animate-pulse');
+                recordBtn.classList.add('bg-red-500', 'hover:bg-red-600');
+                recordText.innerText = "Record";
+                recordIcon.innerText = "⏺";
+                recordStatus.classList.add('hidden');
             }
         });
     </script>
